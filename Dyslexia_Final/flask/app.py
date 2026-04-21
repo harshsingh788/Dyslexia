@@ -27,7 +27,7 @@ tool = language_tool_python.LanguageTool('en-US')
 reader = easyocr.Reader(['en']) # type: ignore
 
 # MongoDB setup
-mongo_client = MongoClient("mongodb://localhost:27017/") # type: ignore
+mongo_client = MongoClient("mongodb+srv://project:project@project.u4o6dhd.mongodb.net/?appName=project") # type: ignore
 mongo_db = mongo_client["dyslexia_app"] # type: ignore
 users_collection = mongo_db["users"] # type: ignore
 prog_collection = mongo_db["progress"] # type: ignore
