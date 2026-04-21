@@ -174,25 +174,40 @@ def predict(text):
 
 def extract_text_from_image(image_file):
     try:
-        img = Image.open(image_file).convert("L")
-        img = img.resize((img.width * 2, img.height * 2))
-        img = img.filter(ImageFilter.MedianFilter())
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(2)
-        text = pytesseract.image_to_string(img, lang='eng', config='--psm 6')
+        # Convert image to format EasyOCR expects (can be PIL Image or path)
+        results = reader.readtext(image_file.read())
+        text = " ".join([res[1] for res in results])
         return text
     except Exception as e:
-        print("OCR error:")
-        return None
+        print(f"OCR error: {e}")
+        # Fallback to Tesseract if EasyOCR fails
+        try:
+            image_file.seek(0)
+            img = Image.open(image_file).convert("L")
+            text = pytesseract.image_to_string(img)
+            return text
+        except:
+            return None
 
 def transcribe_audio(audio_file):
+    temp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             tmp.write(audio_file.read())
-            result = whisper_model.transcribe(tmp.name)
+            temp_path = tmp.name
+        
+        # Audio transcription should happen after the file is closed for Windows compatibility
+        result = whisper_model.transcribe(temp_path)
         return result['text']
-    except:
+    except Exception as e:
+        print(f"Transcription error: {e}")
         return None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
 
 @app.route('/')
 def homeapp():
@@ -207,6 +222,7 @@ def login():
         if user and verify_password(user['password_hash'], password):
             session['logged_in'] = True
             session['username'] = username
+            session['user_id'] = str(user['_id'])
             return redirect(url_for('app_page'))
         flash('Invalid credentials', 'error')
     return render_template('login1.html')
@@ -256,7 +272,7 @@ def app_page():
             if image_file.filename:
                 transcript = extract_text_from_image(image_file)
 
-        if transcript and len(transcript.strip()) >= 20:
+        if transcript and len(transcript.strip()) >= 1:
             corrected_text, errors = correct_text(transcript, username)
             result = predict(transcript)
             original_text = transcript
@@ -281,8 +297,8 @@ def module():
     user = user_profile.find_one({'user_id': user_id}) or {"capability_score": 1.0}
     capability_score = user.get('capability_score', 1.0)
 
-    global paragraph
-    paragraph = generate_custom_paragraph(capability_score)
+    practice_paragraph = generate_custom_paragraph(capability_score)
+    session['practice_paragraph'] = practice_paragraph
 
     progress_history = get_all_progress(user_id)
     previous_texts = [item['reference_text'] for item in progress_history]
@@ -292,7 +308,7 @@ def module():
     for ref in previous_texts   
     ]
 
-    return render_template('module.html', reference_text=paragraph, module_id=0, previous_texts=previous_texts)
+    return render_template('module.html', reference_text=practice_paragraph, module_id=0, previous_texts=previous_texts)
 
 @app.route('/logout')
 def logout():
@@ -432,33 +448,71 @@ def history():
 
 @app.route('/generate_audio', methods=['POST'])
 def generate_audio():
-    data = request.get_json()
+    data = request.get_json() or {}
     rate = int(data.get('rate', 150))
+    
+    # Prioritize text sent from frontend, fallback to session or DB
+    text = data.get('text')
+    if not text:
+        user_id = session.get('user_id', 'guest')
+        progress = get_latest_progress(user_id)
+        text = (progress["reference_text"] if progress and progress.get("reference_text") else session.get('practice_paragraph', ''))
+    
+    if not text or not text.strip():
+        return jsonify({'error': 'No text provided for audio generation'}), 400
 
-    user_id = session.get('user_id', 'guest')
-    progress = get_latest_progress(user_id)
-    text = progress["reference_text"] if progress else "No text available"
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            temp_path = temp_file.name
+        
+        engine.setProperty('rate', rate)
+        engine.save_to_file(text, temp_path)
+        engine.runAndWait()
 
-    engine.setProperty('rate', rate)
+        with open(temp_path, 'rb') as f:
+            audio_base64 = base64.b64encode(f.read()).decode('utf-8')
+        os.remove(temp_path)
+        return jsonify({'audio': f'data:audio/wav;base64,{audio_base64}'})
+    except Exception as e:
+        print(f"Audio generation error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/word_audio')
+def word_audio():
+    word = request.args.get('word', '')
+    if not word:
+        return jsonify({'error': 'No word provided'}), 400
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
         temp_path = temp_file.name
-    engine.save_to_file(text, temp_path)
+    
+    engine.setProperty('rate', 150)
+    engine.save_to_file(word, temp_path)
     engine.runAndWait()
 
     with open(temp_path, 'rb') as f:
         audio_base64 = base64.b64encode(f.read()).decode('utf-8')
     os.remove(temp_path)
     return jsonify({'audio': f'data:audio/wav;base64,{audio_base64}'})
+
+@app.route('/retrain', methods=['POST'])
+def retrain():
+    try:
+        train_model()
+        return jsonify({"message": "Model retrained successfully!"})
+    except Exception as e:
+        return jsonify({"message": f"Error retraining model: {str(e)}"}), 500
+
 import re
 
 def clean_word(word):
-    # Remove punctuation like -, ., ,
-    return re.sub(r'[.,]', '', word.lower())
+    # Remove punctuation like -, ., , ? !
+    return re.sub(r'[.,?!:;]', '', word.lower()).strip()
 
 import difflib
 def compare_texts(user_text, reference_text):
-    reference_words = reference_text.split()
-    user_words = user_text.split()
+    reference_words = [clean_word(w) for w in reference_text.split() if clean_word(w)]
+    user_words = [clean_word(w) for w in user_text.split() if clean_word(w)]
 
     matcher = difflib.SequenceMatcher(None, reference_words, user_words)
     incorrect_words = []
@@ -500,13 +554,13 @@ def check_text():
     user_id = session.get('user_id', 'guest')
     user_text = request.json.get('text', '')
 
-    global paragraph
-    incorrect_words, pronunciations = compare_texts(user_text, paragraph)
+    practice_paragraph = session.get('practice_paragraph', '')
+    incorrect_words, pronunciations = compare_texts(user_text, practice_paragraph)
     # print(pronunciations)
     completed = len(incorrect_words) == 0
 
-    save_progress(user_id,  paragraph, incorrect_words, text_done=completed, audio_done=False)
-    update_user_capability(user_id, paragraph, incorrect_words)
+    save_progress(user_id,  practice_paragraph, incorrect_words, text_done=completed, audio_done=False)
+    update_user_capability(user_id, practice_paragraph, incorrect_words)
 
     return jsonify({
         'incorrect': incorrect_words,
@@ -518,7 +572,8 @@ def check_text():
 
 @app.before_request
 def load_user():
-    session['user_id'] = 'guest'  # Mock user for demonstration
+    if 'user_id' not in session:
+        session['user_id'] = 'guest'
 
 @app.route('/home')
 def home():
@@ -588,5 +643,4 @@ def submit(exercise_type):
     return redirect(url_for('home'))
 
 if __name__ == '__main__':
-    paragraph = ''
     app.run(debug=True)
